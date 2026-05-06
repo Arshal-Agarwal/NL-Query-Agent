@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NL Financial Query Agent</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2e3250;
+    --accent: #4f8ef7;
+    --accent2: #7c5cfc;
+    --green: #22c55e;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --text: #e2e8f0;
+    --muted: #8892a4;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── Header ── */
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  header .logo { font-size: 18px; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  header .subtitle { font-size: 12px; color: var(--muted); }
+  header .spacer { flex: 1; }
+  #model-select { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; }
+  #new-session-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 8px; font-size: 12px; cursor: pointer; transition: background .15s; }
+  #new-session-btn:hover { background: var(--border); }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  #status-dot.connected { background: var(--green); }
+
+  /* ── Layout ── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── Chat panel ── */
+  .chat-panel { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+  #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+  #messages::-webkit-scrollbar { width: 4px; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .msg { display: flex; gap: 10px; max-width: 820px; }
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+  .msg.agent { align-self: flex-start; }
+  .avatar { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+  .msg.user .avatar { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+  .msg.agent .avatar { background: var(--surface2); border: 1px solid var(--border); }
+  .bubble { padding: 12px 16px; border-radius: var(--radius); font-size: 14px; line-height: 1.6; max-width: 680px; }
+  .msg.user .bubble { background: linear-gradient(135deg, #1e3a6e, #2a1f5e); border: 1px solid #3a4a8a; }
+  .msg.agent .bubble { background: var(--surface); border: 1px solid var(--border); }
+
+  /* MCQ */
+  .mcq-block { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .mcq-option { display: flex; align-items: center; gap: 10px; padding: 9px 14px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; font-size: 13px; transition: border-color .15s, background .15s; }
+  .mcq-option:hover { border-color: var(--accent); background: #1e2a45; }
+  .mcq-option.selected { border-color: var(--accent); background: #1e2a45; }
+  .mcq-option.disabled { opacity: .5; cursor: default; pointer-events: none; }
+  .mcq-label { font-weight: 600; color: var(--accent); min-width: 20px; }
+
+  /* Input */
+  .input-area { padding: 16px 20px; background: var(--surface); border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-end; flex-shrink: 0; }
+  #user-input { flex: 1; background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: var(--radius); font-size: 14px; resize: none; min-height: 44px; max-height: 120px; outline: none; transition: border-color .15s; font-family: inherit; }
+  #user-input:focus { border-color: var(--accent); }
+  #user-input::placeholder { color: var(--muted); }
+  #send-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; padding: 12px 20px; border-radius: var(--radius); cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .15s; white-space: nowrap; }
+  #send-btn:disabled { opacity: .4; cursor: default; }
+  #send-btn:not(:disabled):hover { opacity: .85; }
+
+  /* ── Right panel ── */
+  .right-panel { width: 420px; flex-shrink: 0; border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; background: var(--surface); }
+  .panel-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .tab-btn { flex: 1; padding: 12px; font-size: 12px; font-weight: 600; background: none; border: none; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; transition: color .15s, border-color .15s; }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { flex: 1; overflow-y: auto; padding: 16px; display: none; }
+  .tab-content.active { display: block; }
+  .tab-content::-webkit-scrollbar { width: 4px; }
+  .tab-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* Results tab */
+  .result-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .badge { padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge.green { background: #14532d; color: var(--green); }
+  .badge.blue { background: #1e3a6e; color: var(--accent); }
+  .badge.yellow { background: #451a03; color: var(--yellow); }
+  .badge.purple { background: #2e1065; color: #a78bfa; }
+  .confidence-bar { margin-bottom: 14px; }
+  .confidence-bar label { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .bar-track { height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width .5s; }
+
+  /* Data table */
+  .data-table-wrap { overflow-x: auto; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: var(--surface2); color: var(--muted); padding: 8px 10px; text-align: left; font-weight: 600; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); color: var(--text); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+
+  /* Plot */
+  #plot-img { width: 100%; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 14px; }
+
+  /* CoT tab */
+  .cot-step { margin-bottom: 14px; padding: 12px; background: var(--surface2); border-radius: var(--radius); border-left: 3px solid var(--accent2); }
+  .cot-step .step-num { font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+  .cot-step .stage { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+  .cot-step .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+  .cot-step .value { font-size: 12px; color: var(--text); line-height: 1.5; }
+
+  /* Empty state */
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 10px; color: var(--muted); text-align: center; padding: 20px; }
+  .empty-state .icon { font-size: 36px; }
+  .empty-state p { font-size: 13px; line-height: 1.6; }
+
+  /* Typing indicator */
+  .typing { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+  .typing span { width: 6px; height: 6px; background: var(--muted); border-radius: 50%; animation: bounce .9s infinite; }
+  .typing span:nth-child(2) { animation-delay: .15s; }
+  .typing span:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
+
+  /* Saved files */
+  .saved-files { margin-top: 10px; }
+  .saved-files .file-link { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); padding: 4px 0; }
+  .saved-files .file-link span { color: var(--accent); }
+
+  /* Metrics chips */
+  .metrics-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .metric-chip { padding: 3px 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; font-size: 11px; color: var(--text); }
+
+  /* Welcome */
+  .welcome { padding: 20px; }
+  .welcome h2 { font-size: 16px; margin-bottom: 8px; }
+  .welcome p { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 12px; }
+  .example-queries { display: flex; flex-direction: column; gap: 6px; }
+  .example-q { padding: 9px 14px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; cursor: pointer; transition: border-color .15s; }
+  .example-q:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">📊 NL Financial Query Agent</div>
+    <div class="subtitle">Natural language → financial insights</div>
+  </div>
+  <div class="spacer"></div>
+  <select id="model-select"></select>
+  <button id="new-session-btn">＋ New Session</button>
+  <div id="status-dot" title="Disconnected"></div>
+</header>
+
+<div class="main">
+  <!-- Chat -->
+  <div class="chat-panel">
+    <div id="messages"></div>
+    <div class="input-area">
+      <textarea id="user-input" placeholder="Ask a financial question… e.g. 'Show me companies with high ROE over the last 3 years'" rows="1"></textarea>
+      <button id="send-btn" disabled>Send</button>
+    </div>
+  </div>
+
+  <!-- Right panel -->
+  <div class="right-panel">
+    <div class="panel-tabs">
+      <button class="tab-btn active" data-tab="results">Results</button>
+      <button class="tab-btn" data-tab="chart">Chart</button>
+      <button class="tab-btn" data-tab="reasoning">Reasoning</button>
+    </div>
+    <div id="tab-results" class="tab-content active">
+      <div class="empty-state">
+        <div class="icon">🔍</div>
+        <p>Results will appear here after your query is executed.</p>
+      </div>
+    </div>
+    <div id="tab-chart" class="tab-content">
+      <div class="empty-state">
+        <div class="icon">📈</div>
+        <p>Charts will appear here after a successful query.</p>
+      </div>
+    </div>
+    <div id="tab-reasoning" class="tab-content">
+      <div class="empty-state">
+        <div class="icon">🧠</div>
+        <p>The agent's reasoning trace will appear here.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // same origin
+let sessionId = null;
+let pendingMCQ = false;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const messages = $('messages');
+const input = $('user-input');
+const sendBtn = $('send-btn');
+
+function scrollBottom() { messages.scrollTop = messages.scrollHeight; }
+
+function setStatus(ok) {
+  const dot = $('status-dot');
+  dot.className = ok ? 'connected' : '';
+  dot.title = ok ? 'Connected' : 'Disconnected';
+}
+
+// ── Session ───────────────────────────────────────────────────────────────────
+async function loadModels() {
+  try {
+    const res = await fetch(`${API}/models`);
+    const { models } = await res.json();
+    const sel = $('model-select');
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m; opt.textContent = m.split('/')[1] || m;
+      sel.appendChild(opt);
+    });
+  } catch (_) {
+    // server not up yet — populate with defaults so the select isn't empty
+    const defaults = ['groq/llama-3.3-70b-versatile','gemini/gemini-1.5-flash','openai/gpt-4o'];
+    const sel = $('model-select');
+    defaults.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m; opt.textContent = m.split('/')[1] || m;
+      sel.appendChild(opt);
+    });
+  }
+}
+
+async function newSession() {
+  sendBtn.disabled = true;
+  setStatus(false);
+  try {
+    const model = $('model-select').value;
+    const res = await fetch(`${API}/session/new`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    sessionId = data.session_id;
+    setStatus(true);
+    sendBtn.disabled = false;
+    pendingMCQ = false;
+    messages.innerHTML = '';
+    showWelcome();
+    clearRightPanel();
+  } catch (err) {
+    setStatus(false);
+    sendBtn.disabled = false;
+    messages.innerHTML = '';
+    appendMsg('agent', `<p style="color:var(--red)">⚠️ Could not connect to server: ${escHtml(err.message)}<br>Make sure the backend is running: <code>python -m uvicorn api:app --port 8000</code></p>`);
+  }
+}
+
+function showWelcome() {
+  const examples = [
+    'Show companies with ROE > 20 over the last 3 years',
+    'Rank companies by net_profit_margin descending',
+    'Show revenue trend for top 5 companies',
+    'Companies with high ROCE',
+    'Compare PB and earnings_yield for all companies',
+  ];
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.innerHTML = `
+    <div class="avatar">🤖</div>
+    <div class="bubble">
+      <div class="welcome">
+        <h2>Welcome! Ask me anything about the financial dataset.</h2>
+        <p>I can filter, rank, and trend 1,369 companies across metrics like ROE, ROCE, net_profit_margin, EPS, PB, and more (2015–2025).</p>
+        <p>If your query is ambiguous, I'll ask you to clarify with multiple-choice options.</p>
+        <div class="example-queries">
+          ${examples.map(e => `<div class="example-q" onclick="useExample(this)">${e}</div>`).join('')}
+        </div>
+      </div>
+    </div>`;
+  messages.appendChild(div);
+  scrollBottom();
+}
+
+function useExample(el) {
+  input.value = el.textContent;
+  input.style.height = 'auto';
+  sendMessage();
+}
+
+// ── Messaging ─────────────────────────────────────────────────────────────────
+function appendMsg(role, html, isMCQ = false) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  const avatar = role === 'user' ? '👤' : '🤖';
+  div.innerHTML = `<div class="avatar">${avatar}</div><div class="bubble">${html}</div>`;
+  messages.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.id = 'typing-indicator';
+  div.innerHTML = `<div class="avatar">🤖</div><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  messages.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function removeTyping() {
+  const el = $('typing-indicator');
+  if (el) el.remove();
+}
+
+// Parse agent reply: split plain text from MCQ options
+function renderAgentReply(text) {
+  // Detect MCQ: lines starting with A) B) C) D)
+  const lines = text.split('\n');
+  const optionLines = lines.filter(l => /^[A-D]\)/.test(l.trim()));
+  if (optionLines.length === 0) return `<p style="white-space:pre-wrap">${escHtml(text)}</p>`;
+
+  // Split into question part and options
+  const firstOptIdx = lines.findIndex(l => /^[A-D]\)/.test(l.trim()));
+  const questionLines = lines.slice(0, firstOptIdx).join('\n').trim();
+  const afterOptions = lines.slice(firstOptIdx + optionLines.length).join('\n').trim();
+
+  let html = questionLines ? `<p style="white-space:pre-wrap;margin-bottom:10px">${escHtml(questionLines)}</p>` : '';
+  html += `<div class="mcq-block" id="mcq-${Date.now()}">`;
+  optionLines.forEach(line => {
+    const letter = line.trim()[0];
+    const rest = line.trim().slice(2).trim();
+    html += `<div class="mcq-option" data-value="${escHtml(line.trim())}" onclick="selectMCQ(this)">
+      <span class="mcq-label">${letter}</span>
+      <span>${escHtml(rest)}</span>
+    </div>`;
+  });
+  html += '</div>';
+  if (afterOptions) html += `<p style="white-space:pre-wrap;margin-top:10px">${escHtml(afterOptions)}</p>`;
+  return html;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function selectMCQ(el) {
+  if (el.classList.contains('disabled')) return;
+  // Highlight selection
+  el.closest('.mcq-block').querySelectorAll('.mcq-option').forEach(o => o.classList.remove('selected'));
+  el.classList.add('selected');
+  const value = el.dataset.value;
+  // Disable all options
+  el.closest('.mcq-block').querySelectorAll('.mcq-option').forEach(o => o.classList.add('disabled'));
+  // Send as user message
+  setTimeout(() => sendMessage(value), 200);
+}
+
+async function sendMessage(overrideText = null) {
+  const text = overrideText ?? input.value.trim();
+  if (!text || !sessionId) return;
+
+  if (!overrideText) {
+    input.value = '';
+    input.style.height = 'auto';
+  }
+
+  sendBtn.disabled = true;
+  appendMsg('user', `<p>${escHtml(text)}</p>`);
+  const typing = showTyping();
+
+  try {
+    const res = await fetch(`${API}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message: text }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    removeTyping();
+
+    const html = renderAgentReply(data.reply);
+    appendMsg('agent', html, data.is_mcq);
+    pendingMCQ = data.is_mcq;
+
+    if (data.has_result && data.result) {
+      renderResult(data.result);
+      switchTab('results');
+    }
+  } catch (err) {
+    removeTyping();
+    appendMsg('agent', `<p style="color:var(--red)">Error: ${escHtml(err.message)}</p>`);
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+// ── Right panel ───────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === `tab-${name}`));
+}
+
+function clearRightPanel() {
+  ['results','chart','reasoning'].forEach(t => {
+    const icons = { results: '🔍', chart: '📈', reasoning: '🧠' };
+    const msgs = {
+      results: 'Results will appear here after your query is executed.',
+      chart: 'Charts will appear here after a successful query.',
+      reasoning: "The agent's reasoning trace will appear here.",
+    };
+    $(`tab-${t}`).innerHTML = `<div class="empty-state"><div class="icon">${icons[t]}</div><p>${msgs[t]}</p></div>`;
+  });
+}
+
+function renderResult(r) {
+  // ── Results tab ──
+  const conf = r.confidence ?? 1;
+  const confPct = Math.round(conf * 100);
+  const confColor = conf >= 0.8 ? 'green' : conf >= 0.5 ? 'yellow' : 'red';
+
+  let html = `<div class="result-meta">
+    <span class="badge green">${r.summary}</span>
+    <span class="badge ${confColor}">Confidence: ${confPct}%</span>`;
+  if (r.clarifications?.length) html += `<span class="badge purple">${r.clarifications.length} clarification${r.clarifications.length > 1 ? 's' : ''}</span>`;
+  if (r.refinements?.length) html += `<span class="badge yellow">${r.refinements.length} refinement${r.refinements.length > 1 ? 's' : ''}</span>`;
+  html += `</div>`;
+
+  html += `<div class="confidence-bar">
+    <label><span>Confidence</span><span>${confPct}%</span></label>
+    <div class="bar-track"><div class="bar-fill" style="width:${confPct}%"></div></div>
+  </div>`;
+
+  if (r.data?.length) {
+    const keys = Object.keys(r.data[0]);
+    html += `<div class="data-table-wrap"><table><thead><tr>${keys.map(k => `<th>${escHtml(k)}</th>`).join('')}</tr></thead><tbody>`;
+    r.data.forEach(row => {
+      html += `<tr>${keys.map(k => {
+        const v = row[k];
+        const disp = typeof v === 'number' ? v.toFixed(2) : (v ?? '—');
+        return `<td>${escHtml(String(disp))}</td>`;
+      }).join('')}</tr>`;
+    });
+    html += `</tbody></table></div>`;
+  }
+
+  if (r.saved_to) {
+    html += `<div class="saved-files">`;
+    Object.entries(r.saved_to).forEach(([k, v]) => {
+      if (v) html += `<div class="file-link">📄 <span>${escHtml(k)}</span>: ${escHtml(v)}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  $('tab-results').innerHTML = html;
+
+  // ── Chart tab ──
+  if (r.plot_base64) {
+    $('tab-chart').innerHTML = `
+      <img id="plot-img" src="data:image/png;base64,${r.plot_base64}" alt="Query result chart" />
+      <p style="font-size:11px;color:var(--muted)">
+        ${escHtml(r.visualization?.plot_type ?? 'bar')} chart — ${escHtml(r.visualization?.reason ?? '')}
+      </p>`;
+  } else {
+    $('tab-chart').innerHTML = `<div class="empty-state"><div class="icon">📊</div><p>No chart generated for this query.</p></div>`;
+  }
+
+  // ── Reasoning tab ──
+  const stageLabels = {
+    query_understanding:    'Query Understanding',
+    ambiguity_detected:     'Ambiguity Detected',
+    clarification_received: 'Clarification Received',
+    query_execution:        'Query Execution',
+    execution_result:       'Execution Result',
+    threshold_refinement:   'Threshold Refinement',
+    visualization_decision: 'Visualization Decision',
+  };
+  if (r.chain_of_thought?.length) {
+    $('tab-reasoning').innerHTML = r.chain_of_thought.map((step, i) => `
+      <div class="cot-step">
+        <div class="step-num">Step ${i + 1}</div>
+        <div class="stage">${escHtml(stageLabels[step.stage] ?? step.stage)}</div>
+        <div class="label">Observed</div>
+        <div class="value">${escHtml(step.observation)}</div>
+        <div class="label" style="margin-top:6px">Decision</div>
+        <div class="value">${escHtml(step.decision)}</div>
+      </div>`).join('');
+  }
+}
+
+// ── Input auto-resize ─────────────────────────────────────────────────────────
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+$('new-session-btn').addEventListener('click', newSession);
+
+(async () => {
+  await loadModels();
+  await newSession();
+})();
+</script>
+</body>
+</html>
