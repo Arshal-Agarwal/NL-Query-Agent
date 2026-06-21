@@ -56,7 +56,7 @@ def chat(req: ChatRequest):
     if has_result:
         final = agent.finalize()
         agent.last_result = None
-        agent._reasoning = []
+        agent._plot_info  = {}        agent._reasoning = []
 
         # Encode plot as base64 if it exists
         plot_b64 = None

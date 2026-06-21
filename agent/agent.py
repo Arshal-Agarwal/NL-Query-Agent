@@ -1,7 +1,6 @@
 import json
 import litellm
-from tools.execute_query import execute_query
-from tools.plot import decide_plot, render_plot
+from tools.plot import render_plot
 from utils.confidence import compute_confidence
 from agent.prompts import SYSTEM_PROMPT
 
@@ -13,28 +12,59 @@ from agent.prompts import SYSTEM_PROMPT
 #   MODEL=anthropic/claude-3-5-sonnet-20241022 + ANTHROPIC_API_KEY
 
 import os
+_OUTPUTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
 DEFAULT_MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
 
-_TOOL_SCHEMA = [{
-    "type": "function",
-    "function": {
-        "name": "execute_query_tool",
-        "description": "Execute a structured financial query against the dataset.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "metrics":        {"type": "array",  "items": {"type": "string"}, "description": "List of metrics e.g. ['ROE', 'PE']"},
-                "conditions":     {"type": "array",  "items": {"type": "object"}, "description": "List of {metric, op, value} filter conditions"},
-                "intent":         {"type": "array",  "items": {"type": "string"}, "description": "List of intents: filter, rank, trend"},
-                "time":           {"type": "object", "description": "{type: last_n_years, value: int}"},
-                "rank_by":        {"type": "string", "description": "Metric to sort results by"},
-                "rank_ascending": {"type": "boolean","description": "Sort ascending if true"},
-                "limit":          {"type": "integer", "description": "Max rows to return (default 50). Use when user says 'top N' or 'show N'."},
+_TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stats",
+            "description": "Return min/max/mean/median for a metric. Omit metric (pass empty string) to get full dataset schema instead. Use before run_code for qualitative queries or multi-condition feasibility checks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string", "description": "Metric column name, e.g. 'ROE'"},
+                },
+                "required": ["metric"],
             },
-            "required": ["metrics", "conditions", "intent"],
         },
     },
-}]
+    {
+        "type": "function",
+        "function": {
+            "name": "run_code",
+            "description": "Execute pandas code in a sandbox. DATASET (DataFrame) and pd (pandas) are pre-loaded. Code must assign: result (DataFrame) and trend_data (list of dicts with year key, or []). Start with: df = DATASET.copy()",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code":    {"type": "string", "description": "Pandas Python code to execute."},
+                    "intent":  {"type": "array", "items": {"type": "string"}, "description": "List of intents: filter, rank, trend"},
+                    "metrics": {"type": "array", "items": {"type": "string"}, "description": "Metrics used in this query, e.g. ['ROE', 'PB']"},
+                },
+                "required": ["code", "intent", "metrics"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "render_plot",
+            "description": "Render and save a chart. plot_type: bar=compare companies, line=trend over time (needs trend_data), scatter=two metrics vs each other. Skip if row_count==1.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plot_type":        {"type": "string", "enum": ["bar", "line", "scatter"]},
+                    "y_metric":         {"type": "string", "description": "Metric on Y axis"},
+                    "title":            {"type": "string"},
+                    "x_metric_scatter": {"type": "string", "description": "Metric on X axis (scatter only)"},
+                    "reason":           {"type": "string", "description": "Why this plot type was chosen"},
+                },
+                "required": ["plot_type", "y_metric", "title", "reason"],
+            },
+        },
+    },
+]
 
 
 import re
@@ -49,6 +79,13 @@ _QUALITATIVE = re.compile(
     re.IGNORECASE
 )
 _HAS_NUMBER = re.compile(r'[><=!]=?\s*\d+|\d+\s*%')
+
+# Detect when Groq leaks tool calls as plain text instead of structured tool_calls
+_LEAKED_TOOL = re.compile(
+    r'<function[=/](?:run_code|get_stats|render_plot)[^>]*>|'
+    r'"name"\s*:\s*"(?:run_code|get_stats|render_plot)"',
+    re.IGNORECASE
+)
 
 def _condition_has_number(user_msg: str, metric: str) -> bool:
     """Return True if the user explicitly gave a numeric threshold for this metric."""
@@ -70,8 +107,109 @@ def _has_assumed_threshold(user_msg: str, conditions: list) -> bool:
     return False
 
 
-def _execute_query_tool(**kwargs) -> str:
-    return json.dumps(execute_query(kwargs), default=str)
+# ── Tool implementations ────────────────────────────────────────────────────
+
+def _tool_get_schema() -> str:
+    from data.loader import DATASET
+    schema = {
+        "columns": list(DATASET.columns),
+        "dtypes":  {c: str(DATASET[c].dtype) for c in DATASET.columns},
+        "shape":   list(DATASET.shape),
+        "sample":  DATASET.head(3).to_dict(orient="records"),
+    }
+    return json.dumps(schema, default=str)
+
+
+def _tool_get_stats(metric: str) -> str:
+    from data.loader import get_stats, get_columns, DATASET
+    import os, litellm as _litellm
+    if not metric:
+        return json.dumps({
+            "columns": list(DATASET.columns),
+            "dtypes": {c: str(DATASET[c].dtype) for c in DATASET.columns},
+            "shape": list(DATASET.shape),
+        })
+    cols = get_columns()
+    if metric not in cols:
+        # Step 5: LLM-driven derivability check
+        available = [c for c in cols if c not in ("company", "year")]
+        model = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
+        try:
+            resp = _litellm.completion(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"The metric '{metric}' is not in the dataset. "
+                        f"Available columns: {available}. "
+                        "Can this metric be derived from those columns? "
+                        "If yes, respond with a single line: DERIVABLE: <pandas expression using df columns>. "
+                        "If no, respond with: NOT_DERIVABLE"
+                    )
+                }],
+                temperature=0,
+            )
+            answer = resp.choices[0].message.content.strip()
+        except Exception:
+            answer = "NOT_DERIVABLE"
+
+        if answer.startswith("DERIVABLE:"):
+            formula = answer[len("DERIVABLE:"):].strip()
+            return json.dumps({
+                "metric": metric,
+                "derivable": True,
+                "formula": formula,
+                "available_columns": available,
+                "message": (
+                    f"'{metric}' is not in the dataset but can be derived. "
+                    f"Proposed formula: {formula}. "
+                    "Ask the user to confirm before using it."
+                )
+            })
+        return json.dumps({
+            "error": f"'{metric}' not in dataset and cannot be derived. Available: {available}"
+        })
+    return json.dumps({"metric": metric, "stats": get_stats(metric)})
+
+
+def _tool_run_code(code: str, intent: list, metrics: list) -> dict:
+    import pandas as pd
+    from data.loader import DATASET
+    # Strip markdown fences if model adds them
+    if code.startswith("```"):
+        code = "\n".join(l for l in code.splitlines() if not l.startswith("```")).strip()
+    ns = {"DATASET": DATASET, "pd": pd}
+    try:
+        exec(compile(code, "<run_code>", "exec"), ns)
+        result_df  = ns.get("result", pd.DataFrame())
+        trend_data = ns.get("trend_data", [])
+        return {
+            "status":     "success",
+            "result":     result_df.to_dict(orient="records"),
+            "trend_data": trend_data,
+            "row_count":  len(result_df),
+            "code":       code,
+            "intent":     intent,
+            "metrics":    metrics,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e), "code": code, "row_count": 0}
+
+
+def _tool_render_plot(last_result: dict, plot_type: str, y_metric: str, title: str,
+                      x_metric_scatter: str = None, reason: str = "") -> dict:
+    from tools.plot import render_plot as _render
+    plot_dec   = {"should_plot": True, "plot_type": plot_type, "reason": reason or "LLM-chosen"}
+    result     = last_result.get("result", [])
+    trend_data = last_result.get("trend_data", [])
+    intent     = last_result.get("intent", [])
+    pil_img, path = _render(
+        plot_dec, result, trend_data,
+        x_metric="company", y_metric=y_metric,
+        intent=intent, title=title,
+        x_metric_scatter=x_metric_scatter,
+    )
+    return {"plot_saved_to": path, "plot_type": plot_type, "plot_img": pil_img}
 
 
 class NLQueryAgent:
@@ -83,21 +221,30 @@ class NLQueryAgent:
         self.overrides = 0
         self.last_result = None
         self.last_query = None
+        self._plot_info: dict = {}
         self._reasoning: list[dict] = []   # structured CoT log
 
     def _log(self, stage: str, observation: str, decision: str):
         self._reasoning.append({"stage": stage, "observation": observation, "decision": decision})
 
-    def _call_llm(self):
+    def _call_llm(self, force_tool: bool = False):
         import time
         from litellm.exceptions import RateLimitError, BadRequestError
+        # Use "required" when we haven't run any tool yet in this turn (forces proper tool call
+        # instead of Groq leaking <function=...> text). Use "auto" once tool results are in
+        # history so the LLM can respond in plain text with insight/clarification.
+        has_tool_result = any(m.get("role") == "tool" for m in self.history)
+        has_assistant_msg = any(m.get("role") == "assistant" for m in self.history)
+        # Only force required on the very first turn of a brand-new session.
+        # After any assistant message (MCQ, clarification) revert to auto to avoid Groq failures.
+        tool_choice = "required" if (force_tool and not has_tool_result and not has_assistant_msg) else "auto"
         for attempt in range(4):
             try:
                 return litellm.completion(
                     model=self.model,
                     messages=self.history,
                     tools=_TOOL_SCHEMA,
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                 ).choices[0].message
             except RateLimitError:
                 if attempt == 3:
@@ -111,63 +258,106 @@ class NLQueryAgent:
                 time.sleep(1)
 
     def _handle_tool_calls(self, msg) -> bool:
-        """Returns True if tool was executed, False if intercepted for clarification."""
+        """Dispatch granular tools. Returns True if all tools executed, False if intercepted."""
         self.history.append(msg)
         for tc in msg.tool_calls:
+            name = tc.function.name
             args = json.loads(tc.function.arguments)
 
-            # Guard: if user used qualitative words and LLM assumed a threshold, intercept
-            last_user = next(
-                (m["content"] for m in reversed(self.history) if m["role"] == "user"), ""
-            )
-            if _has_assumed_threshold(last_user, args.get("conditions", [])):
-                # Remove the tool call from history and ask instead
-                self.history.pop()
-                # Find the first condition the user didn't explicitly number
-                assumed_cond = next(
-                    (c for c in args.get("conditions", []) if not _condition_has_number(last_user, c.get("metric", ""))),
-                    args["conditions"][0],
-                )
-                metric = assumed_cond["metric"]
-                assumed = assumed_cond["value"]
-                clarification = (
-                    f'What {metric} threshold defines "{_QUALITATIVE.search(last_user).group()}"?\n'
-                    f'A) > {int(assumed * 0.5)}\n'
-                    f'B) > {assumed}\n'
-                    f'C) > {int(assumed * 1.5)}\n'
-                    f'D) Custom'
-                )
-                self.history.append({"role": "assistant", "content": clarification})
-                self.clarifications.append(clarification[:100])
-                self._log(
-                    "ambiguity_detected",
-                    f"LLM assumed {metric} > {assumed} from qualitative word in query.",
-                    "Intercepted tool call — asking user for explicit threshold."
-                )
-                return False
+            # ── get_schema ──────────────────────────────────────────────────
+            if name == "get_schema":
+                self._log("schema_inspection", "Agent requested dataset schema.",
+                          "Returning columns, dtypes, shape, and sample rows.")
+                result_str = _tool_get_schema()
 
-            self._log(
-                "query_execution",
-                f"Resolved query: metrics={args.get('metrics')}, "
-                f"conditions={args.get('conditions')}, intent={args.get('intent')}, "
-                f"time={args.get('time')}, rank_by={args.get('rank_by')}",
-                "Calling execute_query_tool with structured parameters."
-            )
-            result_str = _execute_query_tool(**args)
-            self.last_query = args
-            self.last_result = json.loads(result_str)
-            row_count = self.last_result.get("row_count", 0)
-            status    = self.last_result.get("status", "unknown")
-            self._log(
-                "execution_result",
-                f"Tool returned status={status}, row_count={row_count}.",
-                "Proceeding to evaluate result quality." if row_count > 0
-                else "Result is empty — will trigger refinement loop."
-            )
+            # ── get_stats ───────────────────────────────────────────────────
+            elif name == "get_stats":
+                metric = args.get("metric", "")
+                self._log("stats_inspection",
+                          f"Agent requested stats for '{metric}'.",
+                          "Returning min/max/mean/median to inform threshold decision.")
+                result_str = _tool_get_stats(metric)
+
+            # ── run_code ────────────────────────────────────────────────────
+            elif name == "run_code":
+                code    = args.get("code", "")
+                intent  = args.get("intent", [])
+                metrics = args.get("metrics", [])
+                self._log(
+                    "query_execution",
+                    f"Running pandas code — intent={intent}, metrics={metrics}.",
+                    "Executing in sandbox; capturing result and trend_data.",
+                )
+                run_result = _tool_run_code(code, intent, metrics)
+                self.last_result = run_result
+                self.last_query  = {"intent": intent, "metrics": metrics}
+                row_count = run_result.get("row_count", 0)
+                status    = run_result.get("status", "unknown")
+                self._log(
+                    "execution_result",
+                    f"status={status}, row_count={row_count}.",
+                    "Proceeding to evaluate result quality." if row_count > 0
+                    else "Result is empty — will trigger refinement loop.",
+                )
+                result_str = json.dumps(
+                    {k: v for k, v in run_result.items() if k != "result" or len(v) <= 20},
+                    default=str,
+                )
+                # Trim to minimal context — avoid flooding history with large tables
+                cols = list(run_result["result"][0].keys()) if run_result.get("result") else []
+                preview_cols = cols[:4]  # only first 4 columns in preview
+                preview = [{k: r[k] for k in preview_cols if k in r}
+                           for r in run_result.get("result", [])[:3]]
+                trimmed = {
+                    "status":    run_result["status"],
+                    "row_count": row_count,
+                    "columns":   cols,
+                    "preview":   preview,
+                    "trend_data_rows": len(run_result.get("trend_data", [])),
+                    "error":     run_result.get("error"),
+                }
+                result_str = json.dumps(trimmed, default=str)
+
+            # ── render_plot ─────────────────────────────────────────────────
+            elif name == "render_plot":
+                if not self.last_result or self.last_result.get("row_count", 0) == 0:
+                    result_str = json.dumps({"error": "No result to plot. Run run_code first."})
+                else:
+                    plot_type        = args.get("plot_type", "bar")
+                    y_metric         = args.get("y_metric", (self.last_query or {}).get("metrics", ["ROE"])[0])
+                    title            = args.get("title", f"Results — {y_metric}")
+                    x_metric_scatter = args.get("x_metric_scatter")
+                    reason           = args.get("reason", "")
+                    self._log(
+                        "visualization_decision",
+                        f"Agent chose plot_type='{plot_type}', y_metric='{y_metric}', x='{x_metric_scatter}'.",
+                        reason or "Rendering chart with normalization applied where appropriate.",
+                    )
+                    plot_info = _tool_render_plot(self.last_result, plot_type, y_metric, title,
+                                                  x_metric_scatter=x_metric_scatter, reason=reason)
+                    self._plot_info = plot_info  # stash for finalize()
+                    result_str = json.dumps(
+                        {"plot_saved_to": plot_info["plot_saved_to"], "plot_type": plot_type},
+                        default=str,
+                    )
+
+            else:
+                result_str = json.dumps({"error": f"Unknown tool: {name}"})
+
+            # Prune: keep only the last 2 tool messages to limit token growth
+            tool_msgs = [i for i, m in enumerate(self.history) if m.get("role") == "tool"]
+            if len(tool_msgs) >= 2:
+                # Remove the oldest tool message and its preceding assistant tool_call message
+                oldest = tool_msgs[0]
+                # also remove the assistant message that triggered it (one step before)
+                remove = sorted({oldest, oldest - 1} & set(range(len(self.history))), reverse=True)
+                for idx in remove:
+                    if idx >= 0:
+                        self.history.pop(idx)
             self.history.append({
-                "role": "tool",
+                "role":        "tool",
                 "tool_call_id": tc.id,
-                "content": result_str,
+                "content":     result_str,
             })
         return True
 
@@ -222,36 +412,16 @@ class NLQueryAgent:
                 "Parsing intent, identifying metrics and time range, detecting ambiguous terms."
             )
 
-        while True:
-            msg = self._call_llm()
-            if msg.tool_calls:
-                executed = self._handle_tool_calls(msg)
-                if not executed:
-                    # intercepted — clarification already appended, return it
-                    return self.history[-1]["content"]
-                continue
-            content = msg.content or ""
-            # If tool just ran successfully with results, suppress any spurious refinement MCQ
-            if (self.last_result and self.last_result.get("row_count", 0) > 0
-                    and "Would you like to" in content and "Lower to" in content):
-                # Strip the refinement block — keep only the insight text before it
-                content = content[:content.index("Would you like to")].strip()
-            self.history.append({"role": "assistant", "content": content})
-            is_refinement_msg = "Would you like to" in content and "Lower to" in content
-            if any(opt in content for opt in ["A)", "B)", "C)"]) and not is_refinement_msg:
-                self.clarifications.append(content[:100])
-                self._log(
-                    "ambiguity_detected",
-                    "Query contains undefined terms or missing thresholds.",
-                    "Generating MCQ clarification to resolve before execution."
-                )
-            return content
+        # Step 10: use LangGraph instead of while True loop
+        from agent.graph import run_graph
+        has_assistant = any(m.get("role") == "assistant" for m in self.history)
+        return run_graph(self, first_call=not has_assistant)
 
     def finalize(self) -> dict:
         if not self.last_result or self.last_result.get("status") != "success":
             return {"status": "no_result"}
 
-        import csv, textwrap
+        import csv
         from datetime import datetime
         from utils.normalize import should_normalize
 
@@ -261,15 +431,14 @@ class NLQueryAgent:
         metrics  = (self.last_query or {}).get("metrics", [])
         y_metric = metrics[0] if metrics else "ROE"
 
-        os.makedirs("outputs", exist_ok=True)
+        os.makedirs(_OUTPUTS_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # --- chain of thought ---
         chain_of_thought = self._reasoning
 
         # --- save query code ---
         query_code = self.last_result.get("code", "")
-        query_code_path = f"outputs/query_{ts}.py"
+        query_code_path = os.path.join(_OUTPUTS_DIR, f"query_{ts}.py")
         with open(query_code_path, "w") as f:
             f.write("# Auto-generated query code\nfrom data.loader import DATASET\nimport pandas as pd\n\n")
             body = "\n".join(
@@ -278,24 +447,27 @@ class NLQueryAgent:
             )
             f.write(body + "\n")
 
-        # --- plot ---
-        plot_dec  = decide_plot(intent, len(result))
-        self._log(
-            "visualization_decision",
-            f"intent={intent}, row_count={len(result)}, y_metric={y_metric}.",
-            f"Selected plot_type='{plot_dec.get('plot_type')}': {plot_dec.get('reason')}."
-        )
-        plot_path = None
+        # --- plot: use what render_plot tool already produced, or fall back ---
+        plot_info = self._plot_info
+        plot_path = plot_info.get("plot_saved_to")
+        plot_img  = plot_info.get("plot_img")
+        plot_type = plot_info.get("plot_type", "bar")
+        should_plot = bool(plot_path)
+
+        # Build a plot_dec-compatible dict for the output JSON
+        plot_dec = {
+            "should_plot": should_plot,
+            "plot_type":   plot_type,
+            "reason":      "LLM-chosen plot type" if should_plot else "no plot requested",
+            "plot_saved_to": plot_path,
+            "plot_img":    plot_img,
+        }
+
+        # --- save plot code (reproducible standalone script) ---
         plot_code_path = None
-        if plot_dec.get("should_plot"):
-            plot_path = render_plot(
-                plot_dec, result, trend,
-                x_metric="company", y_metric=y_metric,
-                intent=intent, title=f"Results — {y_metric}",
-            )
-            plot_type = plot_dec.get("plot_type", "bar")
-            do_norm   = should_normalize(intent, y_metric)
-            plot_code_path = f"outputs/plot_{ts}.py"
+        if should_plot:
+            do_norm = should_normalize(intent, y_metric)
+            plot_code_path = os.path.join(_OUTPUTS_DIR, f"plot_{ts}.py")
             lines = [
                 "# Auto-generated plot code",
                 "import matplotlib; matplotlib.use('Agg')",
@@ -336,7 +508,7 @@ class NLQueryAgent:
         # --- save CSV ---
         csv_path = None
         if result:
-            csv_path = f"outputs/results_{ts}.csv"
+            csv_path = os.path.join(_OUTPUTS_DIR, f"results_{ts}.csv")
             with open(csv_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=result[0].keys())
                 writer.writeheader()
@@ -349,12 +521,12 @@ class NLQueryAgent:
             "clarifications":   self.clarifications,
             "refinements":      self.refinements,
             "chain_of_thought": chain_of_thought,
-            "visualization":    {**plot_dec, "plot_saved_to": plot_path},
+            "visualization":    plot_dec,
             "data":             result,
             "trend_data":       trend,
         }
 
-        json_path = f"outputs/result_{ts}.json"
+        json_path = os.path.join(_OUTPUTS_DIR, f"result_{ts}.json")
         with open(json_path, "w") as f:
             json.dump(final, f, indent=2, default=str)
 
@@ -459,4 +631,5 @@ def run():
             _print_final(final)
             # reset so we don't re-print on next turn unless a new query runs
             agent.last_result = None
-            agent._reasoning = []
+            agent._plot_info  = {}
+            agent._reasoning  = []

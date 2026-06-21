@@ -2,19 +2,11 @@ from data.loader import DATASET, get_columns, get_stats
 
 VALID_METRICS = set(get_columns()) - {"company", "year"}
 
-# Derivable metrics: metric -> (required columns, formula description)
-DERIVABLE = {
-    "gross_margin": ({"revenue"}, "revenue-based approximation"),
-}
-
 def check_metrics(metrics: list) -> dict:
     missing = [m for m in metrics if m not in VALID_METRICS]
-    derivable = {m: DERIVABLE[m][1] for m in missing if m in DERIVABLE}
-    truly_missing = [m for m in missing if m not in DERIVABLE]
     return {
-        "valid": len(truly_missing) == 0,
-        "missing": truly_missing,
-        "derivable": derivable,
+        "valid": len(missing) == 0,
+        "missing": missing,
         "available": sorted(VALID_METRICS),
     }
 
