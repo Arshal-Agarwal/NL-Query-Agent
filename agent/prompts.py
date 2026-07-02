@@ -143,7 +143,12 @@ If row_count == 0:
   No companies matched [condition].
   Would you like to:
   A) Lower threshold to [dataset mean]
-  B) Keep as is
+  B) Lower threshold to [dataset median]
+  C) View distribution first (see min/max/mean/median before deciding)
+  D) Keep as is
+
+When the user picks C, call get_stats(metric) and display the stats,
+then re-ask the same A/B/C/D refinement MCQ. Do NOT re-execute the query until user picks A, B, or D.
 
 If row_count > 0: give 2-3 sentence insight. Do NOT repeat the table - the system renders it.
 """

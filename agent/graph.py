@@ -69,13 +69,13 @@ def _node_handle_text(state: AgentState) -> AgentState:
             return {**state, "output": ""}
 
     # Suppress spurious refinement MCQ when we already have results
-    if (agent.last_result and agent.last_result.get("row_count", 0) > 0
-            and "Would you like to" in content and "Lower to" in content):
+    _is_refine = "Would you like to" in content
+    if agent.last_result and agent.last_result.get("row_count", 0) > 0 and _is_refine:
         content = content[:content.index("Would you like to")].strip()
 
     agent.history.append({"role": "assistant", "content": content})
 
-    is_refinement_msg = "Would you like to" in content and "Lower to" in content
+    is_refinement_msg = "Would you like to" in content
     if any(opt in content for opt in ["A)", "B)", "C)"]) and not is_refinement_msg:
         agent.clarifications.append(content[:100])
         agent._log(
@@ -87,9 +87,12 @@ def _node_handle_text(state: AgentState) -> AgentState:
     return {**state, "output": content}
 
 
-def _route_after_tools(state: AgentState) -> str:
-    # After tools run, always go back to call_llm for the LLM to process results
-    return "call_llm"
+def _route_after_text(state: AgentState) -> str:
+    # If _node_handle_text ran tools (leaked-tool recovery), loop back to call_llm
+    if state["agent"]._pending_tool_loop:
+        state["agent"]._pending_tool_loop = False
+        return "call_llm"
+    return END
 
 
 def build_graph():
@@ -104,7 +107,10 @@ def build_graph():
         "handle_text":  "handle_text",
     })
     g.add_edge("handle_tools", "call_llm")
-    g.add_edge("handle_text",  END)
+    g.add_conditional_edges("handle_text", _route_after_text, {
+        "call_llm": "call_llm",
+        END:        END,
+    })
 
     return g.compile()
 

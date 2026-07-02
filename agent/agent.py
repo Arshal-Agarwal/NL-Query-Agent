@@ -109,17 +109,6 @@ def _has_assumed_threshold(user_msg: str, conditions: list) -> bool:
 
 # ── Tool implementations ────────────────────────────────────────────────────
 
-def _tool_get_schema() -> str:
-    from data.loader import DATASET
-    schema = {
-        "columns": list(DATASET.columns),
-        "dtypes":  {c: str(DATASET[c].dtype) for c in DATASET.columns},
-        "shape":   list(DATASET.shape),
-        "sample":  DATASET.head(3).to_dict(orient="records"),
-    }
-    return json.dumps(schema, default=str)
-
-
 def _tool_get_stats(metric: str) -> str:
     from data.loader import get_stats, get_columns, DATASET
     import os, litellm as _litellm
@@ -135,21 +124,30 @@ def _tool_get_stats(metric: str) -> str:
         available = [c for c in cols if c not in ("company", "year")]
         model = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
         try:
-            resp = _litellm.completion(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"The metric '{metric}' is not in the dataset. "
-                        f"Available columns: {available}. "
-                        "Can this metric be derived from those columns? "
-                        "If yes, respond with a single line: DERIVABLE: <pandas expression using df columns>. "
-                        "If no, respond with: NOT_DERIVABLE"
+            import time as _time
+            from litellm.exceptions import RateLimitError as _RLE
+            for _attempt in range(4):
+                try:
+                    resp = _litellm.completion(
+                        model=model,
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                f"The metric '{metric}' is not in the dataset. "
+                                f"Available columns: {available}. "
+                                "Can this metric be derived from those columns? "
+                                "If yes, respond with a single line: DERIVABLE: <pandas expression using df columns>. "
+                                "If no, respond with: NOT_DERIVABLE"
+                            )
+                        }],
+                        temperature=0,
                     )
-                }],
-                temperature=0,
-            )
-            answer = resp.choices[0].message.content.strip()
+                    answer = resp.choices[0].message.content.strip()
+                    break
+                except _RLE:
+                    if _attempt == 3:
+                        raise
+                    _time.sleep(2 ** (_attempt + 2))
         except Exception:
             answer = "NOT_DERIVABLE"
 
@@ -227,7 +225,24 @@ class NLQueryAgent:
     def _log(self, stage: str, observation: str, decision: str):
         self._reasoning.append({"stage": stage, "observation": observation, "decision": decision})
 
+    def _trim_history(self, keep_turns: int = 6) -> None:
+        """Keep system prompt + last keep_turns user/assistant exchanges to limit TPM.
+        Tool messages within those turns are preserved.
+        """
+        system = [m for m in self.history if m.get("role") == "system"]
+        rest   = [m for m in self.history if m.get("role") != "system"]
+        # Count user turns
+        turn_indices, turn = [], 0
+        for i, m in enumerate(rest):
+            if m.get("role") == "user":
+                turn += 1
+            turn_indices.append(turn)
+        cutoff = max(0, turn - keep_turns)
+        rest = [m for m, t in zip(rest, turn_indices) if t > cutoff]
+        self.history = system + rest
+
     def _call_llm(self, force_tool: bool = False):
+        self._trim_history()
         import time
         from litellm.exceptions import RateLimitError, BadRequestError
         # Use "required" when we haven't run any tool yet in this turn (forces proper tool call
@@ -264,14 +279,8 @@ class NLQueryAgent:
             name = tc.function.name
             args = json.loads(tc.function.arguments)
 
-            # ── get_schema ──────────────────────────────────────────────────
-            if name == "get_schema":
-                self._log("schema_inspection", "Agent requested dataset schema.",
-                          "Returning columns, dtypes, shape, and sample rows.")
-                result_str = _tool_get_schema()
-
             # ── get_stats ───────────────────────────────────────────────────
-            elif name == "get_stats":
+            if name == "get_stats":
                 metric = args.get("metric", "")
                 self._log("stats_inspection",
                           f"Agent requested stats for '{metric}'.",
@@ -363,11 +372,65 @@ class NLQueryAgent:
 
     def chat(self, user_message: str) -> str:
         # Detect if this is a refinement response
-        is_refinement = any(
-            "Would you like to" in (m.get("content") or "") and "Lower to" in (m.get("content") or "")
-            for m in self.history[-3:] if m["role"] == "assistant"
+        # Condition: last assistant message has "Would you like to"
+        # AND last run_code returned row_count == 0 (confirmed empty result)
+        _last_row_count = (self.last_result or {}).get("row_count", -1)
+        is_refinement = (
+            _last_row_count == 0
+            and any(
+                "Would you like to" in (m.get("content") or "")
+                for m in self.history[-3:] if m["role"] == "assistant"
+            )
         )
         if is_refinement:
+            user_choice = user_message.strip().upper()
+            # Step 12: intercept C) View distribution first
+            if user_choice.startswith("C"):
+                import re as _re, json as _json
+                # Get metric from last_query, fallback to scanning last refinement message
+                metrics_in_query = (self.last_query or {}).get("metrics", [])
+                metric = metrics_in_query[0] if metrics_in_query else ""
+                if not metric:
+                    last_refine_msg = next(
+                        (m["content"] for m in reversed(self.history)
+                         if m["role"] == "assistant" and "Would you like to" in (m.get("content") or "")),
+                        ""
+                    )
+                    m_match = _re.search(
+                        r"\b(ROE|ROCE|ROA|net_profit_margin|EPS|earnings_yield|enterprise_value|PB|price_to_revenue|revenue_per_share)\b",
+                        last_refine_msg
+                    )
+                    metric = m_match.group(1) if m_match else ""
+                # Fetch distribution stats
+                if metric:
+                    stats = _json.loads(_tool_get_stats(metric)).get("stats", {})
+                    dist_text = (
+                        "Distribution for " + metric + ":\n"
+                        "  Min    : " + str(stats.get("min", "N/A")) + "\n"
+                        "  Max    : " + str(stats.get("max", "N/A")) + "\n"
+                        "  Mean   : " + str(stats.get("mean", "N/A")) + "\n"
+                        "  Median : " + str(stats.get("median", "N/A")) + "\n"
+                    )
+                    self._log(
+                        "distribution_viewed",
+                        "User requested distribution for '" + metric + "' before deciding threshold.",
+                        "Stats: " + str(stats)
+                    )
+                else:
+                    dist_text = "(Could not determine metric for distribution.)\n"
+                # Re-ask the refinement MCQ with stats shown above it
+                reply = (
+                    dist_text
+                    + "\nNo companies matched. Based on the above, would you like to:\n"
+                    + "A) Lower threshold to mean\n"
+                    + "B) Lower threshold to median\n"
+                    + "C) View distribution first\n"
+                    + "D) Keep as is"
+                )
+                self.history.append({"role": "user", "content": user_message})
+                self.history.append({"role": "assistant", "content": reply})
+                return reply
+            # A, B, D — normal refinement flow (re-execute with adjusted threshold)
             self.overrides += 1
             self.refinements.append(user_message.strip())
             self._log(
@@ -375,6 +438,7 @@ class NLQueryAgent:
                 f"Empty result triggered refinement MCQ. User chose: '{user_message.strip()}'.",
                 "Updating threshold and re-executing query."
             )
+
 
         # Detect if this is answering a clarification MCQ
         is_clarification = any(
@@ -435,6 +499,22 @@ class NLQueryAgent:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         chain_of_thought = self._reasoning
+
+        # --- extract insight (last non-MCQ assistant message) ---
+        insight = ""
+        for m in reversed(self.history):
+            if m.get("role") == "assistant":
+                c = (m.get("content") or "").strip()
+                if c and not any(opt in c for opt in ["A)", "B)", "C)"]):
+                    insight = c
+                    break
+
+        # --- extract thresholds from executed code ---
+        import re as _re
+        thresholds = {}
+        for m in _re.finditer(r"df\['(\w+)'\]\s*([><=!]+)\s*([\d.]+)", self.last_result.get("code", "")):
+            thresholds[m.group(1)] = f"{m.group(2)}{m.group(3)}"
+
 
         # --- save query code ---
         query_code = self.last_result.get("code", "")
@@ -517,6 +597,8 @@ class NLQueryAgent:
         final = {
             "status":           "success",
             "summary":          f"{len(result)} companies found",
+            "insight":           insight,
+            "thresholds":        thresholds,
             "confidence":       compute_confidence(len(self.clarifications), len(self.refinements), self.overrides),
             "clarifications":   self.clarifications,
             "refinements":      self.refinements,
